@@ -4,7 +4,7 @@ PJM Data Center Siting Analysis
 Pulls Day-Ahead and Real-Time LMP data plus system/zonal load from PJM
 via the gridstatus library, computes location-level summary metrics,
 ranks locations on cost / stability / congestion / basis criteria, and
-produces CSV exports and diagnostic plots.
+produces CSV exports and an interactive HTML dashboard.
 
 Metrics produced per location:
   - Average DA and RT LMP
@@ -27,30 +27,28 @@ Usage
 -----
   python pjm_siting_analysis.py
 
-Outputs are written to ./out/ (CSVs, PNGs, and console executive summary).
+Outputs are written to ./out/ (CSVs, interactive HTML dashboard, and
+console executive summary).
 
 Timezone Handling
 -----------------
 gridstatus returns PJM timestamps in US/Eastern (EPT).  All internal
-processing preserves this timezone.  Plot axes are labelled as ET.
+processing preserves this timezone.
 If timestamps arrive timezone-naive, they are localized to US/Eastern.
 """
 
 import os
 import sys
+import json
+import math
 import logging
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
-import matplotlib
-matplotlib.use("Agg")  # non-interactive backend (server / CI safe)
-import matplotlib.pyplot as plt  # noqa: E402
-import matplotlib.dates as mdates  # noqa: E402
-
-import gridstatus  # noqa: E402
-from gridstatus import Markets  # noqa: E402
+import gridstatus
+from gridstatus import Markets
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -84,15 +82,36 @@ LOCATION_MODE: str = "zonal"
 # discovery pull that prints available nodes and exits.
 LOCATIONS: list = []
 
-# Resample frequency for time-series plots ("D" = daily, "W" = weekly).
-# Summary statistics always use the native hourly granularity.
-RESAMPLE_FREQ: str = "D"
-
 # Output directory (relative to this script).
 OUT_DIR: Path = Path(__file__).resolve().parent / "out"
 
-# Number of top locations to show in time-series plots.
-TOP_N: int = 5
+# Number of top locations to show on the map and in tables.
+TOP_N: int = 15
+
+# Approximate geographic centers for PJM pricing zones (lat, lon).
+# Used to place markers on the interactive Leaflet map.
+ZONE_COORDS: dict = {
+    "AE":     (39.36, -74.42),   # Atlantic City Electric — southern NJ
+    "AEP":    (39.96, -82.99),   # American Electric Power — Columbus OH
+    "APS":    (41.10, -80.65),   # Allegheny Power — western PA / OH border
+    "ATSI":   (41.50, -81.69),   # FirstEnergy — Cleveland OH
+    "BC":     (39.29, -76.61),   # BGE — Baltimore MD
+    "COMED":  (41.88, -87.63),   # ComEd — Chicago IL
+    "DAYTON": (39.76, -84.20),   # Dayton P&L — Dayton OH
+    "DEOK":   (39.10, -84.51),   # Duke Energy OH/KY — Cincinnati
+    "DOM":    (37.54, -77.44),   # Dominion — Richmond VA
+    "DPL":    (39.74, -75.55),   # Delmarva Power — Wilmington DE
+    "DUQ":    (40.44, -79.99),   # Duquesne Light — Pittsburgh PA
+    "EKPC":   (38.05, -84.50),   # Eastern KY Power — Lexington KY
+    "JC":     (40.49, -74.45),   # Jersey Central — central NJ
+    "ME":     (40.33, -75.93),   # Met-Ed — Reading PA
+    "PE":     (39.95, -75.17),   # PECO — Philadelphia PA
+    "PEP":    (38.91, -77.04),   # Pepco — Washington DC
+    "PL":     (40.61, -75.49),   # PPL — Allentown PA
+    "PN":     (41.24, -78.73),   # Penelec — north-central PA
+    "PS":     (40.74, -74.17),   # PSE&G — Newark NJ
+    "RECO":   (41.05, -74.13),   # Rockland Electric — northern NJ
+}
 
 
 # ===================================================================
@@ -649,192 +668,388 @@ def compute_rankings(summary: pd.DataFrame) -> pd.DataFrame:
 
 
 # ===================================================================
-# SECTION 8 – PLOTS
+# SECTION 8 – INTERACTIVE HTML DASHBOARD
 # ===================================================================
 
-def plot_daily_rt_lmp(
-    df_merged: pd.DataFrame,
-    rankings: pd.DataFrame,
-) -> None:
+# The template uses __PLACEHOLDER__ tokens (not {braces}) to avoid
+# conflicts with CSS and JavaScript curly braces.
+
+HTML_TEMPLATE = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PJM Data Center Siting Analysis</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+      integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="" />
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+        integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
+<style>
+*,*::before,*::after{box-sizing:border-box}
+body{
+  font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  margin:0; padding:0; background:#f4f5f7; color:#333;
+}
+header{
+  background:linear-gradient(135deg,#1a1a2e 0%,#16213e 100%);
+  color:#fff; padding:24px 32px; margin-bottom:20px;
+}
+header h1{margin:0; font-size:1.7em; font-weight:700}
+header p{margin:6px 0 0; opacity:.8; font-size:.92em}
+.container{max-width:1280px; margin:0 auto; padding:0 20px 40px}
+#controls{
+  display:flex; align-items:center; gap:12px;
+  margin-bottom:16px; flex-wrap:wrap;
+}
+#controls label{font-weight:600; font-size:.95em}
+#controls select{
+  padding:8px 14px; border-radius:6px; border:1px solid #c0c0c0;
+  font-size:.93em; background:#fff; cursor:pointer;
+}
+#map{
+  height:520px; width:100%; border-radius:10px;
+  box-shadow:0 2px 12px rgba(0,0,0,.12); margin-bottom:24px;
+}
+#table-container{
+  overflow-x:auto; background:#fff; border-radius:10px;
+  box-shadow:0 2px 12px rgba(0,0,0,.12);
+}
+table{width:100%; border-collapse:collapse; font-size:.88em}
+thead{position:sticky; top:0; z-index:2}
+th{
+  background:#1a1a2e; color:#fff; padding:11px 14px;
+  cursor:pointer; white-space:nowrap; user-select:none;
+  font-weight:600; text-align:right; border-bottom:2px solid #0f3460;
+}
+th:first-child,th:nth-child(2){text-align:left}
+th:hover{background:#2a2a4e}
+th .arrow{font-size:.7em; margin-left:4px; opacity:.6}
+th .arrow.active{opacity:1}
+td{padding:9px 14px; border-bottom:1px solid #eaeaea; text-align:right}
+td:first-child,td:nth-child(2){text-align:left; font-weight:600}
+tr:nth-child(even){background:#f8f8fc}
+tr:hover{background:#e6eaf4}
+tr.highlighted{background:#fff3cd !important; transition:background .3s}
+.legend-box{
+  background:#fff; padding:10px 14px; border-radius:6px;
+  box-shadow:0 1px 5px rgba(0,0,0,.2); font-size:.85em; line-height:1.6;
+}
+.legend-box i{display:inline-block; width:14px; height:14px; margin-right:6px;
+  vertical-align:middle; border-radius:50%}
+.note{
+  margin-top:16px; font-size:.82em; color:#777; text-align:center;
+}
+</style>
+</head>
+<body>
+
+<header>
+  <h1>PJM Data Center Siting Analysis</h1>
+  <p>__START_DATE__ to __END_DATE__&ensp;|&ensp;__N_LOCATIONS__ zones analyzed
+     &ensp;|&ensp;Mode: __LOCATION_MODE__</p>
+</header>
+
+<div class="container">
+
+<div id="controls">
+  <label for="ranking-select">Rank by:</label>
+  <select id="ranking-select">
+    <option value="cheap_stable">Cheap + Stable</option>
+    <option value="low_congestion">Low Congestion Risk</option>
+    <option value="low_basis">Low Basis Risk</option>
+  </select>
+</div>
+
+<div id="map"></div>
+
+<div id="table-container">
+<table id="data-table">
+  <thead>
+    <tr>
+      <th data-col="rank" data-type="num">Rank<span class="arrow"></span></th>
+      <th data-col="location" data-type="str">Location<span class="arrow"></span></th>
+      <th data-col="avg_lmp_rt" data-type="num">Avg RT LMP<span class="arrow"></span></th>
+      <th data-col="avg_lmp_da" data-type="num">Avg DA LMP<span class="arrow"></span></th>
+      <th data-col="avg_congestion_rt" data-type="num">Congestion RT<span class="arrow"></span></th>
+      <th data-col="avg_cong_share_rt" data-type="num">Cong Share<span class="arrow"></span></th>
+      <th data-col="vol_lmp_rt" data-type="num">Vol RT<span class="arrow"></span></th>
+      <th data-col="p95_lmp_rt" data-type="num">P95 RT<span class="arrow"></span></th>
+      <th data-col="avg_basis" data-type="num">Avg Basis<span class="arrow"></span></th>
+      <th data-col="vol_basis" data-type="num">Vol Basis<span class="arrow"></span></th>
+      <th data-col="corr_load_rt" data-type="num">Load Corr<span class="arrow"></span></th>
+      <th data-col="count_hours" data-type="num">Hours<span class="arrow"></span></th>
+    </tr>
+  </thead>
+  <tbody></tbody>
+</table>
+</div>
+
+<p class="note">
+  Map tiles &copy; <a href="https://openstreetmap.org">OpenStreetMap</a> contributors.
+  Data from PJM via gridstatus.  Open <code>out/rankings.csv</code> for full data.
+</p>
+
+</div><!-- .container -->
+
+<script>
+// ---- Embedded data (injected by Python) ----
+const DATA = __DATA_JSON__;
+
+// ---- Ranking configuration ----
+const RANKINGS = {
+  cheap_stable:   {rankCol:'cheap_stable_rank',   scoreCol:'cheap_stable_score',   label:'Cheap + Stable'},
+  low_congestion: {rankCol:'low_congestion_rank',  scoreCol:'low_congestion_score',  label:'Low Congestion Risk'},
+  low_basis:      {rankCol:'low_basis_rank',       scoreCol:'low_basis_score',       label:'Low Basis Risk'},
+};
+const TOP_N = __TOP_N__;
+
+// ---- Color scale: score 0 (best/green) → 1 (worst/red) ----
+function getColor(score){
+  if(score===null||score===undefined||isNaN(score)) return '#999';
+  const s = Math.max(0, Math.min(1, score));
+  const hue = 120*(1-s);          // 120=green, 0=red
+  return 'hsl('+hue+',70%,42%)';
+}
+
+// ---- Format helpers ----
+function fmt$(v){ return v===null||v===undefined?'N/A':'$'+v.toFixed(2); }
+function fmt4(v){ return v===null||v===undefined?'N/A':v.toFixed(4); }
+function fmt3(v){ return v===null||v===undefined?'N/A':v.toFixed(3); }
+function fmtInt(v){ return v===null||v===undefined?'N/A':Math.round(v).toLocaleString(); }
+
+// ---- Initialize Leaflet map ----
+const map = L.map('map').setView([39.8, -79.0], 6);
+L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png',{
+  attribution:'&copy; <a href="https://openstreetmap.org">OpenStreetMap</a> contributors',
+  maxZoom:18,
+}).addTo(map);
+
+// Layer group for markers (cleared on each update).
+let markerLayer = L.layerGroup().addTo(map);
+let markerMap = {};  // location_short → marker
+
+// ---- Legend control ----
+const legend = L.control({position:'bottomright'});
+legend.onAdd = function(){
+  const div = L.DomUtil.create('div','legend-box');
+  div.innerHTML =
+    '<strong>Score</strong><br>'+
+    '<i style="background:hsl(120,70%,42%)"></i> Best (low)<br>'+
+    '<i style="background:hsl(60,70%,42%)"></i> Mid<br>'+
+    '<i style="background:hsl(0,70%,42%)"></i> Worst (high)';
+  return div;
+};
+legend.addTo(map);
+
+// ---- State ----
+let currentRows = [];         // top-N rows for the active ranking
+let tableSortCol = null;
+let tableSortAsc = true;
+
+// ---- Update map markers ----
+function updateMap(rankKey){
+  markerLayer.clearLayers();
+  markerMap = {};
+  const cfg = RANKINGS[rankKey];
+
+  // Sort all data by the ranking column, take top N.
+  const sorted = DATA.slice().sort((a,b)=>(a[cfg.rankCol]||999)-(b[cfg.rankCol]||999));
+  currentRows = sorted.slice(0, TOP_N);
+
+  // Compute score range for color mapping within the displayed set.
+  const scores = currentRows.map(r=>r[cfg.scoreCol]).filter(v=>v!==null&&!isNaN(v));
+  const sMin = Math.min(...scores);
+  const sMax = Math.max(...scores);
+  const sRange = sMax-sMin || 1;
+
+  currentRows.forEach(function(r){
+    if(r.lat===null||r.lon===null||r.lat===undefined||r.lon===undefined) return;
+    const normScore = (r[cfg.scoreCol]-sMin)/sRange;
+    const color = getColor(normScore);
+    const marker = L.circleMarker([r.lat, r.lon],{
+      radius:11, fillColor:color, color:'#333', weight:1.5,
+      fillOpacity:0.85, opacity:1,
+    }).addTo(markerLayer);
+
+    marker.bindPopup(
+      '<div style="font-size:.9em;line-height:1.5">'+
+      '<strong>'+r.location_short+'</strong><br>'+
+      cfg.label+' Rank: <b>#'+r[cfg.rankCol]+'</b><br>'+
+      'Avg RT LMP: <b>'+fmt$(r.avg_lmp_rt)+'</b>/MWh<br>'+
+      'Volatility RT: '+fmt$(r.vol_lmp_rt)+'<br>'+
+      'Congestion RT: '+fmt$(r.avg_congestion_rt)+'<br>'+
+      'Avg Basis: '+fmt$(r.avg_basis)+'<br>'+
+      'Score: '+fmt4(r[cfg.scoreCol])+
+      '</div>'
+    );
+
+    // Click marker → highlight table row.
+    marker.on('click', function(){
+      highlightTableRow(r.location_short);
+    });
+
+    markerMap[r.location_short] = marker;
+  });
+}
+
+// ---- Update table ----
+function updateTable(rankKey){
+  const cfg = RANKINGS[rankKey];
+  // Reset sort state when ranking changes.
+  tableSortCol = cfg.rankCol;
+  tableSortAsc = true;
+  renderTable();
+}
+
+function renderTable(){
+  const tbody = document.querySelector('#data-table tbody');
+  tbody.innerHTML = '';
+
+  // Sort currentRows by tableSortCol.
+  const rows = currentRows.slice();
+  rows.sort(function(a,b){
+    let va = a[tableSortCol], vb = b[tableSortCol];
+    if(va===null||va===undefined) va = Infinity;
+    if(vb===null||vb===undefined) vb = Infinity;
+    if(typeof va==='string') return tableSortAsc?va.localeCompare(vb):vb.localeCompare(va);
+    return tableSortAsc?(va-vb):(vb-va);
+  });
+
+  rows.forEach(function(r, idx){
+    const tr = document.createElement('tr');
+    tr.dataset.loc = r.location_short||'';
+    tr.innerHTML =
+      '<td>'+(idx+1)+'</td>'+
+      '<td>'+((r.location_short||r.location)||'')+'</td>'+
+      '<td>'+fmt$(r.avg_lmp_rt)+'</td>'+
+      '<td>'+fmt$(r.avg_lmp_da)+'</td>'+
+      '<td>'+fmt$(r.avg_congestion_rt)+'</td>'+
+      '<td>'+fmt4(r.avg_cong_share_rt)+'</td>'+
+      '<td>'+fmt$(r.vol_lmp_rt)+'</td>'+
+      '<td>'+fmt$(r.p95_lmp_rt)+'</td>'+
+      '<td>'+fmt$(r.avg_basis)+'</td>'+
+      '<td>'+fmt$(r.vol_basis)+'</td>'+
+      '<td>'+fmt3(r.corr_load_rt)+'</td>'+
+      '<td>'+fmtInt(r.count_hours)+'</td>';
+
+    // Hover table row → highlight map marker.
+    tr.addEventListener('mouseenter', function(){
+      const m = markerMap[r.location_short];
+      if(m){ m.setStyle({radius:16, weight:3}); m.bringToFront(); }
+    });
+    tr.addEventListener('mouseleave', function(){
+      const m = markerMap[r.location_short];
+      if(m) m.setStyle({radius:11, weight:1.5});
+    });
+
+    tbody.appendChild(tr);
+  });
+
+  // Update sort arrows.
+  document.querySelectorAll('#data-table th .arrow').forEach(function(el){
+    el.textContent = '';
+    el.classList.remove('active');
+  });
+  const activeHeader = document.querySelector('#data-table th[data-col="'+tableSortCol+'"] .arrow');
+  if(activeHeader){
+    activeHeader.textContent = tableSortAsc?' \u25B2':' \u25BC';
+    activeHeader.classList.add('active');
+  }
+}
+
+// ---- Highlight a table row by location_short ----
+function highlightTableRow(locShort){
+  // Remove previous highlights.
+  document.querySelectorAll('#data-table tr.highlighted').forEach(function(el){
+    el.classList.remove('highlighted');
+  });
+  const row = document.querySelector('#data-table tr[data-loc="'+locShort+'"]');
+  if(row){
+    row.classList.add('highlighted');
+    row.scrollIntoView({behavior:'smooth', block:'center'});
+    setTimeout(function(){ row.classList.remove('highlighted'); }, 3000);
+  }
+}
+
+// ---- Column header click → sort ----
+document.querySelectorAll('#data-table th').forEach(function(th){
+  th.addEventListener('click', function(){
+    const col = th.dataset.col;
+    if(!col) return;
+    if(tableSortCol===col){ tableSortAsc=!tableSortAsc; }
+    else{ tableSortCol=col; tableSortAsc=true; }
+    renderTable();
+  });
+});
+
+// ---- Dropdown change handler ----
+document.getElementById('ranking-select').addEventListener('change', function(){
+  const key = this.value;
+  updateMap(key);
+  updateTable(key);
+});
+
+// ---- Initial render ----
+updateMap('cheap_stable');
+updateTable('cheap_stable');
+</script>
+</body>
+</html>"""
+
+
+def _clean_for_json(value):
+    """Convert NaN / Infinity to None for valid JSON serialization."""
+    if isinstance(value, float) and (math.isnan(value) or math.isinf(value)):
+        return None
+    return value
+
+
+def generate_html(rankings: pd.DataFrame) -> None:
     """
-    Daily average RT LMP time series for the TOP_N cheapest+stable
-    locations.  Saves plot_daily_rt_lmp.png.
+    Generate a self-contained HTML dashboard with an interactive
+    Leaflet map and sortable data table.  Writes out/index.html.
     """
-    top_locs = (
-        rankings.nsmallest(TOP_N, "cheap_stable_rank")["location"].tolist()
-    )
-    subset = df_merged[df_merged["location"].isin(top_locs)].copy()
-    if subset.empty:
-        log.warning("plot_daily_rt_lmp: no data for top locations.")
-        return
+    all_data = rankings.copy()
 
-    subset["time"] = pd.to_datetime(subset["time"])
-    daily = (
-        subset
-        .set_index("time")
-        .groupby("location")["lmp_total_rt"]
-        .resample(RESAMPLE_FREQ)
-        .mean()
-        .reset_index()
-    )
+    # Add lat/lon coordinates by mapping location_short through
+    # map_location_to_zone() to get the normalized zone key, then
+    # looking up in ZONE_COORDS.
+    def _get_coord(loc_short, idx):
+        zone_key = map_location_to_zone(loc_short)
+        coords = ZONE_COORDS.get(zone_key)
+        return coords[idx] if coords else None
 
-    fig, ax = plt.subplots(figsize=(12, 6))
-    for loc in top_locs:
-        loc_data = daily[daily["location"] == loc]
-        ax.plot(loc_data["time"], loc_data["lmp_total_rt"], label=loc, linewidth=1.2)
+    all_data["lat"] = all_data["location_short"].apply(lambda x: _get_coord(x, 0))
+    all_data["lon"] = all_data["location_short"].apply(lambda x: _get_coord(x, 1))
 
-    ax.set_xlabel("Date (ET)")
-    ax.set_ylabel("RT LMP ($/MWh)")
-    ax.set_title(f"Daily Avg RT LMP — Top {TOP_N} Cheapest + Stable Locations")
-    ax.legend(loc="upper right", fontsize=8)
-    ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m-%d"))
-    fig.autofmt_xdate(rotation=30)
-    ax.grid(True, alpha=0.3)
+    # Warn about unmatched locations (table only, no map dot).
+    unmatched = all_data[all_data["lat"].isna()]["location"].tolist()
+    if unmatched:
+        log.warning(
+            "No coordinates for: %s (will appear in table but not on map)",
+            unmatched,
+        )
 
-    fig.tight_layout()
-    path = OUT_DIR / "plot_daily_rt_lmp.png"
-    fig.savefig(path, dpi=150)
-    plt.close(fig)
-    log.info("Saved %s", path)
+    # Convert to JSON-safe records (NaN → null).
+    records = [
+        {k: _clean_for_json(v) for k, v in row.items()}
+        for row in all_data.to_dict(orient="records")
+    ]
+    json_str = json.dumps(records, default=str, indent=2)
 
+    # Build HTML from template using safe token replacement.
+    html = HTML_TEMPLATE
+    html = html.replace("__DATA_JSON__", json_str)
+    html = html.replace("__START_DATE__", START_DATE)
+    html = html.replace("__END_DATE__", END_DATE)
+    html = html.replace("__N_LOCATIONS__", str(len(all_data)))
+    html = html.replace("__LOCATION_MODE__", LOCATION_MODE)
+    html = html.replace("__TOP_N__", str(TOP_N))
 
-def plot_lmp_histogram(
-    df_merged: pd.DataFrame,
-    location_name: str,
-) -> None:
-    """
-    Histogram of hourly RT LMP for a single location.
-    Saves plot_lmp_histogram.png.
-    """
-    data = df_merged.loc[
-        df_merged["location"] == location_name, "lmp_total_rt"
-    ].dropna()
-
-    if data.empty:
-        log.warning("plot_lmp_histogram: no RT data for '%s'.", location_name)
-        return
-
-    mean_val = data.mean()
-    p95_val = data.quantile(0.95)
-
-    fig, ax = plt.subplots(figsize=(10, 5))
-    ax.hist(data, bins=80, edgecolor="black", linewidth=0.4, alpha=0.7, color="steelblue")
-    ax.axvline(mean_val, color="red", linestyle="--", linewidth=1.2, label=f"Mean = ${mean_val:.2f}")
-    ax.axvline(p95_val, color="orange", linestyle="--", linewidth=1.2, label=f"P95 = ${p95_val:.2f}")
-
-    ax.set_xlabel("RT LMP ($/MWh)")
-    ax.set_ylabel("Hour Count")
-    ax.set_title(f"RT LMP Distribution — {location_name}")
-    ax.legend(fontsize=9)
-    ax.grid(True, alpha=0.3, axis="y")
-
-    fig.tight_layout()
-    path = OUT_DIR / "plot_lmp_histogram.png"
-    fig.savefig(path, dpi=150)
-    plt.close(fig)
-    log.info("Saved %s", path)
-
-
-def plot_lmp_vs_load(
-    df_merged: pd.DataFrame,
-    location_name: str,
-) -> None:
-    """
-    Scatter plot of daily avg RT LMP vs daily avg load for one location.
-    Annotates with Pearson correlation.  Saves plot_lmp_vs_load.png.
-    """
-    subset = df_merged[df_merged["location"] == location_name].copy()
-    subset = subset[["time", "lmp_total_rt", "load_mw"]].dropna()
-
-    if len(subset) < 5:
-        log.warning("plot_lmp_vs_load: insufficient data for '%s'.", location_name)
-        return
-
-    subset["time"] = pd.to_datetime(subset["time"])
-    daily = subset.set_index("time").resample(RESAMPLE_FREQ).mean().dropna()
-
-    if len(daily) < 3:
-        log.warning("plot_lmp_vs_load: insufficient daily data for '%s'.", location_name)
-        return
-
-    load = daily["load_mw"].values
-    lmp = daily["lmp_total_rt"].values
-    corr = np.corrcoef(load, lmp)[0, 1]
-
-    fig, ax = plt.subplots(figsize=(8, 6))
-    ax.scatter(load, lmp, alpha=0.5, s=18, color="teal", edgecolors="none")
-
-    # OLS trend line.
-    coeffs = np.polyfit(load, lmp, 1)
-    trend_x = np.linspace(load.min(), load.max(), 100)
-    trend_y = np.polyval(coeffs, trend_x)
-    ax.plot(trend_x, trend_y, color="tomato", linewidth=1.5, linestyle="-")
-
-    ax.annotate(
-        f"r = {corr:.3f}",
-        xy=(0.05, 0.92),
-        xycoords="axes fraction",
-        fontsize=11,
-        bbox=dict(boxstyle="round,pad=0.3", fc="lightyellow", ec="gray"),
-    )
-
-    ax.set_xlabel("Load (MW)")
-    ax.set_ylabel("RT LMP ($/MWh)")
-    ax.set_title(f"RT LMP vs Load (Daily Avg) — {location_name}")
-    ax.grid(True, alpha=0.3)
-
-    fig.tight_layout()
-    path = OUT_DIR / "plot_lmp_vs_load.png"
-    fig.savefig(path, dpi=150)
-    plt.close(fig)
-    log.info("Saved %s", path)
-
-
-def plot_basis_timeseries(
-    df_merged: pd.DataFrame,
-    rankings: pd.DataFrame,
-) -> None:
-    """
-    Daily average DA-RT basis for the TOP_N locations with lowest
-    basis risk.  Saves plot_basis_timeseries.png.
-    """
-    top_locs = (
-        rankings.nsmallest(TOP_N, "low_basis_rank")["location"].tolist()
-    )
-    subset = df_merged[df_merged["location"].isin(top_locs)].copy()
-    if subset.empty or "basis" not in subset.columns:
-        log.warning("plot_basis_timeseries: no basis data for top locations.")
-        return
-
-    subset["time"] = pd.to_datetime(subset["time"])
-    daily = (
-        subset
-        .set_index("time")
-        .groupby("location")["basis"]
-        .resample(RESAMPLE_FREQ)
-        .mean()
-        .reset_index()
-    )
-
-    fig, ax = plt.subplots(figsize=(12, 6))
-    for loc in top_locs:
-        loc_data = daily[daily["location"] == loc]
-        ax.plot(loc_data["time"], loc_data["basis"], label=loc, linewidth=1.2)
-
-    ax.axhline(0, color="black", linewidth=0.8, linestyle="-")
-    ax.set_xlabel("Date (ET)")
-    ax.set_ylabel("DA − RT Basis ($/MWh)")
-    ax.set_title(f"Daily DA-RT Basis — Top {TOP_N} Low-Basis-Risk Locations")
-    ax.legend(loc="upper right", fontsize=8)
-    ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m-%d"))
-    fig.autofmt_xdate(rotation=30)
-    ax.grid(True, alpha=0.3)
-
-    fig.tight_layout()
-    path = OUT_DIR / "plot_basis_timeseries.png"
-    fig.savefig(path, dpi=150)
-    plt.close(fig)
-    log.info("Saved %s", path)
+    # Write to file.
+    path = OUT_DIR / "index.html"
+    path.write_text(html, encoding="utf-8")
+    log.info("Saved interactive dashboard: %s", path)
 
 
 # ===================================================================
@@ -921,6 +1136,7 @@ def print_executive_summary(
                 )
 
     print(f"\nOutput files: {OUT_DIR}/")
+    print(f"Interactive dashboard: {OUT_DIR / 'index.html'}")
     print(sep)
     print()
 
@@ -954,23 +1170,12 @@ def main() -> None:
     log.info("=== STEP 4: Rankings ===")
     rankings = compute_rankings(summary)
 
-    # Step 5: Plots – each in its own try/except so one failure
-    # does not block the others.
-    log.info("=== STEP 5: Generating Plots ===")
-    best_loc = rankings.nsmallest(1, "cheap_stable_rank")["location"].iloc[0]
-    log.info("Best location for single-location plots: %s", best_loc)
-
-    plot_jobs = [
-        (plot_daily_rt_lmp, (df_merged, rankings)),
-        (plot_lmp_histogram, (df_merged, best_loc)),
-        (plot_lmp_vs_load, (df_merged, best_loc)),
-        (plot_basis_timeseries, (df_merged, rankings)),
-    ]
-    for fn, args in plot_jobs:
-        try:
-            fn(*args)
-        except Exception as exc:
-            log.warning("Plot %s failed: %s", fn.__name__, exc)
+    # Step 5: Generate interactive HTML dashboard.
+    log.info("=== STEP 5: Generating Interactive Dashboard ===")
+    try:
+        generate_html(rankings)
+    except Exception as exc:
+        log.warning("HTML dashboard generation failed: %s", exc)
 
     # Step 6: Executive summary.
     log.info("=== STEP 6: Executive Summary ===")
@@ -1006,9 +1211,9 @@ if __name__ == "__main__":
 #        out/lmp_merged.csv           Aligned DA+RT with basis & load
 #        out/location_summary.csv     Per-location summary metrics
 #        out/rankings.csv             Summary + composite scores & ranks
-#        out/plot_daily_rt_lmp.png    Time series: top 5 cheapest
-#        out/plot_lmp_histogram.png   Histogram: best location
-#        out/plot_lmp_vs_load.png     Scatter: LMP vs load
-#        out/plot_basis_timeseries.png  Basis over time: top 5
+#        out/index.html               Interactive map + data table dashboard
 #
-# 6. A textual executive summary is printed to the console.
+# 6. Open out/index.html in a web browser to view the interactive
+#    dashboard with Leaflet map and sortable data table.
+#
+# 7. A textual executive summary is also printed to the console.
